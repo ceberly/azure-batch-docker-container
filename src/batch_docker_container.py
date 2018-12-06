@@ -41,9 +41,11 @@ check_env_var("STORAGE_ACCOUNT_NAME")
 check_env_var("STORAGE_ACCOUNT_KEY")
 check_env_var("INPUT_STORAGE_CONTAINER")
 check_env_var("OUTPUT_STORAGE_CONTAINER")
-check_env_var("MODEL_URL")
-check_env_var("MAXIMUM_JOB_TIME")
-
+#check_env_var("MODEL_URL")
+check_env_var("MAXIMUM_JOB_TIME_MINUTES")
+check_env_var("AZURECR_SERVER")
+check_env_var("AZURECR_USERNAME")
+check_env_var("AZURECR_PASSWORD")
 
 def print_batch_exception(batch_exception):
     """
@@ -233,27 +235,44 @@ def add_tasks(batch_service_client, job_id, input_blobs, output_container_sas_ur
 
     tasks = list()
 
+    user = batchmodels.UserIdentity(
+        auto_user=batchmodels.AutoUserSpecification(
+            scope=batchmodels.AutoUserScope.task,
+            elevation_level=batchmodels.ElevationLevel.admin))
+
     for idx, input_blob in enumerate(input_blobs):
-        command = "/bin/bash -c \"docker run -rm {}  -e INPUT_BLOB='{}' -e OUTPUT_STORAGE_CONTAINER='{}' -e MODEL_URL='{}'\"".format(
-            os.environ['CONTAINER_IMAGE'], input_blob.name, os.environ['OUTPUT_STORAGE_CONTAINER'], os.environ['MODEL_URL'])
+        command = "sudo /bin/bash -c \"docker login --username {} --password {} {}; docker run --rm {} {} '{}' '{}' {}\"".format(
+            os.environ['AZURECR_USERNAME'], os.environ['AZURECR_PASSWORD'],
+            os.environ['AZURECR_SERVER'], os.environ['CONTAINER_IMAGE'],
+            os.environ['CONTAINER_CMD'], input_blob.sas_url,
+            output_container_sas_url, os.environ['CONTAINER_ARGS'])
         tasks.append(batch.models.TaskAddParameter(
             id='Task{}'.format(idx),
             command_line=command,
+            user_identity=user,
         ))
     batch_service_client.task.add_collection(job_id, tasks)
 
 
-def get_all_input_blobs(blob_client, storage_container):
+def get_all_input_blobs(blob_client, storage_container, prefix=None):
     blobs = []
     marker = None
     while True:
-        batch = blob_client.list_blobs(storage_container, marker=marker)
+        batch = blob_client.list_blobs(storage_container, prefix=prefix,
+                                       marker=marker)
         blobs.extend(batch)
         if not batch.next_marker:
             break
         marker = batch.next_marker
+
+    sas_token = get_container_sas_token(blob_client, storage_container,
+                                        azureblob.BlobPermissions.READ)
+
     for blob in blobs:
         print('processing: ' + blob.name)
+        sas_url = blob_client.make_blob_url(storage_container, blob.name,
+                                            sas_token=sas_token)
+        blob.sas_url = sas_url
 
     return blobs
 
@@ -309,7 +328,8 @@ if __name__ == '__main__':
     # don't yet exist.
 
     input_blobs = get_all_input_blobs(
-        blob_client, os.environ['INPUT_STORAGE_CONTAINER'])
+        blob_client, os.environ['INPUT_STORAGE_CONTAINER'],
+        prefix=os.environ.get('INPUT_STORAGE_PREFIX'))
 
     output_container_name = os.environ['OUTPUT_STORAGE_CONTAINER']
 
@@ -350,7 +370,7 @@ if __name__ == '__main__':
         # Pause execution until tasks reach Completed state.
         wait_for_tasks_to_complete(batch_client,
                                    os.environ['JOB_ID'],
-                                   datetime.timedelta(minutes=os.environ['MAXIMUM_JOB_TIME_MINUTES']))
+                                   datetime.timedelta(minutes=int(os.environ['MAXIMUM_JOB_TIME_MINUTES'])))
 
         print("  Success! All tasks reached the 'Completed' state within the "
               "specified timeout period.")
@@ -368,12 +388,11 @@ if __name__ == '__main__':
     print('End time: {}'.format(end_time))
     print('Elapsed time: {}'.format(elapsed_time))
 
-    if "INSTANCE_COST" in os.environ:
-        cost = (elapsed_time.total_seconds() / 3600.0) * \
-            (int(os.environ['DEDICATED_POOL_NODE_COUNT']) +
-             int(os.environ['LOW_PRIORITY_POOL_NODE_COUNT'])) * float(os.environ['INSTANCE_COST'])
-        print('Cost estimate: ${}'.format(cost))
+    cost = (elapsed_time.total_seconds() / 3600.0) * \
+        (int(os.environ['DEDICATED_POOL_NODE_COUNT']) +
+         int(os.environ['LOW_PRIORITY_POOL_NODE_COUNT'])) * float(os.environ['INSTANCE_COST'])
+    print('Cost estimate: ${}'.format(cost))
 
     # Clean up Batch resources
-    batch_client.job.delete(os.environ['JOB_ID'])
-    batch_client.pool.delete(os.environ['POOL_ID'])
+    #batch_client.job.delete(os.environ['JOB_ID'])
+    #batch_client.pool.delete(os.environ['POOL_ID'])
